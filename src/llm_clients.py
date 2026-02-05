@@ -1,5 +1,7 @@
 from dataclasses import dataclass
 from typing import List, Dict, Optional
+import streamlit as st
+
 
 from transformers import (
     AutoTokenizer,
@@ -8,7 +10,7 @@ from transformers import (
     AutoModelForCausalLM,
 )
 
-from src.config import MODEL_MODE, GROQ_API_KEY, GROQ_MODEL, LOCAL_MODEL_ID
+from src.config import MODEL_MODE, GROQ_API_KEY, GROQ_MODEL, LOCAL_MODEL_ID, HF_TOKEN
 
 
 # =========================
@@ -46,41 +48,47 @@ def groq_chat(
 
 
 # =========================
-# Local model (HF, CPU-safe)
+# Local model (HF, cached for Streamlit)
 # =========================
-_LOCAL_TOKENIZER = None
-_LOCAL_MODEL = None
-_LOCAL_KIND = None  # "seq2seq" or "causal"
+
+_LOCAL_KIND = None  # just for reference
 
 
 def _detect_model_kind(model_id: str) -> str:
-    """
-    Detect whether the model is Seq2Seq (T5/Flan)
-    or CausalLM (Qwen, TinyLlama, Falcon).
-    """
-    cfg = AutoConfig.from_pretrained(model_id)
+    cfg = AutoConfig.from_pretrained(model_id, token=HF_TOKEN if HF_TOKEN else None)
     if getattr(cfg, "is_encoder_decoder", False):
         return "seq2seq"
     return "causal"
 
 
-def _load_local_model():
-    global _LOCAL_TOKENIZER, _LOCAL_MODEL, _LOCAL_KIND
+@st.cache_resource(show_spinner=True)
+def _cached_local_model(model_id: str):
+    """
+    Load once per Streamlit session (fast reruns).
+    """
+    kind = _detect_model_kind(model_id)
 
-    if _LOCAL_TOKENIZER is not None and _LOCAL_MODEL is not None:
-        return _LOCAL_TOKENIZER, _LOCAL_MODEL, _LOCAL_KIND
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_id,
+        token=HF_TOKEN if HF_TOKEN else None,
+    )
 
-    _LOCAL_KIND = _detect_model_kind(LOCAL_MODEL_ID)
-
-    _LOCAL_TOKENIZER = AutoTokenizer.from_pretrained(LOCAL_MODEL_ID)
-
-    if _LOCAL_KIND == "seq2seq":
-        _LOCAL_MODEL = AutoModelForSeq2SeqLM.from_pretrained(LOCAL_MODEL_ID)
+    if kind == "seq2seq":
+        model = AutoModelForSeq2SeqLM.from_pretrained(
+            model_id,
+            token=HF_TOKEN if HF_TOKEN else None,
+        )
     else:
-        _LOCAL_MODEL = AutoModelForCausalLM.from_pretrained(LOCAL_MODEL_ID)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            token=HF_TOKEN if HF_TOKEN else None,
+        )
 
-    return _LOCAL_TOKENIZER, _LOCAL_MODEL, _LOCAL_KIND
+    return tokenizer, model, kind
 
+
+def _load_local_model():
+    return _cached_local_model(LOCAL_MODEL_ID)
 
 def local_chat(
     messages: List[Dict[str, str]],
@@ -109,7 +117,6 @@ def local_chat(
     )
 
     if kind == "seq2seq":
-        # Flan / T5 style
         output_ids = model.generate(
             **inputs,
             max_new_tokens=256,
@@ -121,19 +128,18 @@ def local_chat(
         ).strip()
         return LLMResponse(text=text)
 
-    # CausalLM (Qwen, TinyLlama, Falcon)
+    # CausalLM (Gemma, Qwen, TinyLlama, Falcon)
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     output_ids = model.generate(
         **inputs,
-        max_new_tokens=256,
+        max_new_tokens=96,
         do_sample=(temperature > 0),
         temperature=max(0.1, float(temperature)),
         pad_token_id=tokenizer.pad_token_id,
     )
 
-    # Only decode newly generated tokens
     gen_ids = output_ids[0][inputs["input_ids"].shape[-1]:]
     text = tokenizer.decode(
         gen_ids,

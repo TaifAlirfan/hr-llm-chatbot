@@ -1,17 +1,26 @@
 import re
 import pandas as pd
-from typing import List, Dict, Tuple
+from typing import List, Dict
 
 from .rag_sql import SCHEMA_HINT, run_sql
 from .llm_clients import chat
 
 
+# -------------------------
+# System Prompts
+# -------------------------
 SQL_SYSTEM = f"""
-You are an expert data analyst who writes SQLite SQL.
+You are an expert data analyst who writes SQLite SQL for the HR dataset.
+
 {SCHEMA_HINT}
 
-Output ONLY ONE SQL query.
-No explanations. No markdown fences.
+CRITICAL RULES:
+- Table name is exactly: employees
+- Attrition is TEXT with values 'Yes' or 'No' (NOT 1/0). Never use Attrition = 1 or Attrition = 0.
+- Department is TEXT.
+- MonthlyIncome, Age, JobSatisfaction are numeric columns.
+- For rates/percentages: avoid integer division by using 1.0 * ... or 100.0 * ...
+- Output ONLY ONE SQL SELECT query. No explanations. No markdown fences.
 """
 
 ANSWER_SYSTEM = """
@@ -25,36 +34,28 @@ Rules:
 - Keep the answer concise and professional.
 - Use at most 2 short bullet points or 1 short paragraph.
 
-If the result table is empty, say no matching records were found and suggest a better filter.
+IMPORTANT:
+- If results are present, NEVER say "no matching records".
+- If results are empty, say no matching records were found and suggest a better filter.
 """
-
 
 
 # -------------------------
 # Helpers: normalization / validation
 # -------------------------
 def _normalize_sql(sql: str) -> str:
-    """Remove markdown fences and extra whitespace."""
     s = (sql or "").replace("```sql", "").replace("```", "").strip()
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
 
 def _extract_first_select(sql: str) -> str:
-    """
-    If the model outputs multiple statements or repeats itself,
-    keep only the first SELECT...; statement.
-    """
     s = _normalize_sql(sql)
-
-    # Remove the hallucinated word "Only" (common in weak local outputs)
     s = re.sub(r"\bOnly\b", "", s, flags=re.IGNORECASE).strip()
 
-    # Take only the first statement up to first semicolon
     if ";" in s:
         s = s.split(";")[0].strip() + ";"
 
-    # Ensure it starts with SELECT
     idx = s.lower().find("select")
     if idx > 0:
         s = s[idx:]
@@ -62,17 +63,21 @@ def _extract_first_select(sql: str) -> str:
     return s.strip()
 
 
+def _contains_bad_attrition(sql: str) -> bool:
+    s = _extract_first_select(sql).lower()
+    return ("attrition = 1" in s) or ("attrition=1" in s) or ("attrition = 0" in s) or ("attrition=0" in s)
+
+
 def is_valid_sql_for_hr(sql: str) -> bool:
-    """
-    Strict validation to keep local models on track.
-    Ensures SQL references the correct table and looks like a real query.
-    """
     s = _extract_first_select(sql).lower()
 
     if not s.startswith("select"):
         return False
 
     if " from employees" not in s:
+        return False
+
+    if _contains_bad_attrition(s):
         return False
 
     bad_patterns = [
@@ -89,7 +94,6 @@ def is_valid_sql_for_hr(sql: str) -> bool:
 
 
 def ensure_limit(sql: str, default_limit: int = 50) -> str:
-    """Add LIMIT if missing, but do NOT add LIMIT to pure COUNT queries."""
     s = _extract_first_select(sql)
 
     # Don't add LIMIT to count queries
@@ -107,14 +111,49 @@ def is_count_question(q: str) -> bool:
     return any(k in q for k in keywords)
 
 
+def _match_known_sql(user_question: str) -> str | None:
+    """
+    Deterministic templates for high-importance queries (must be correct).
+    """
+    q = user_question.strip().lower()
+
+    # Attrition rate by department
+    if "attrition rate" in q and "department" in q:
+        return """
+        SELECT
+          Department,
+          ROUND(100.0 * SUM(CASE WHEN Attrition = 'Yes' THEN 1 ELSE 0 END) / COUNT(*), 2)
+            AS AttritionRatePercent
+        FROM employees
+        GROUP BY Department
+        ORDER BY AttritionRatePercent DESC;
+        """.strip()
+
+    # Average MonthlyIncome by department
+    if ("average" in q or "avg" in q) and "monthlyincome" in q and "department" in q:
+        return """
+        SELECT
+          Department,
+          ROUND(AVG(MonthlyIncome), 2) AS AvgMonthlyIncome
+        FROM employees
+        GROUP BY Department
+        ORDER BY AvgMonthlyIncome DESC;
+        """.strip()
+
+    return None
+
+
 # -------------------------
 # Core: SQL generation / repair
 # -------------------------
 def generate_sql(user_question: str, memory: List[Dict[str, str]], mode: str) -> str:
-    # ✅ Hard rule: count questions should be deterministic and not rely on weak local models
+    # 1) Deterministic known queries first
+    known = _match_known_sql(user_question)
+    if known:
+        return known
+
+    # 2) Deterministic simple count
     if is_count_question(user_question):
-        # Generic count; if user also mentions a condition (e.g., above 39) LLM will still be used.
-        # We'll only force raw count if it's a plain "how many employees are there" style.
         if not any(w in user_question.lower() for w in ["where", "above", "below", "greater", "less", "older", "younger", ">", "<", "="]):
             return "SELECT COUNT(*) AS employee_count FROM employees;"
 
@@ -137,6 +176,12 @@ def generate_sql(user_question: str, memory: List[Dict[str, str]], mode: str) ->
     # First attempt
     sql = _llm_sql()
 
+    # Guard against Attrition = 1/0
+    if _contains_bad_attrition(sql):
+        sql = _llm_sql(
+            "Reminder: Attrition is TEXT ('Yes'/'No'), never 1/0. Fix and output ONE valid SELECT query."
+        )
+
     if is_valid_sql_for_hr(sql):
         return sql
 
@@ -144,6 +189,7 @@ def generate_sql(user_question: str, memory: List[Dict[str, str]], mode: str) ->
     sql_retry = _llm_sql(
         "Your previous SQL was invalid. You MUST query the SQLite table 'employees' "
         "and output ONLY ONE valid SELECT statement. Include 'FROM employees'. "
+        "Attrition is TEXT ('Yes'/'No'). For rates use 100.0*SUM(CASE...)/COUNT(*). "
         "If the question asks 'how many', use SELECT COUNT(*)."
     )
 
@@ -160,6 +206,12 @@ def repair_sql(user_question: str, bad_sql: str, error_msg: str, memory, mode: s
 
     fixed = chat(messages, temperature=0.0, mode=mode).text
     fixed = ensure_limit(fixed)
+
+    # Guard again
+    if _contains_bad_attrition(fixed):
+        fixed = fixed.replace("Attrition = 1", "Attrition = 'Yes'").replace("Attrition=1", "Attrition='Yes'")
+        fixed = fixed.replace("Attrition = 0", "Attrition = 'No'").replace("Attrition=0", "Attrition='No'")
+
     return fixed
 
 
@@ -182,7 +234,11 @@ def answer_with_data(
     memory: List[Dict[str, str]],
     mode: str
 ) -> str:
-    table_preview = df.head(20).to_markdown(index=False) if not df.empty else "(no rows)"
+    # ✅ Stop hallucinations: if empty, return deterministic message (no LLM)
+    if df is None or df.empty:
+        return "No matching records were found. Try refining the question (e.g., specify a department, a range, or a specific attribute)."
+
+    table_preview = df.head(20).to_markdown(index=False)
 
     messages = [{"role": "system", "content": ANSWER_SYSTEM}]
 
@@ -190,8 +246,10 @@ def answer_with_data(
         messages.append({"role": "user", "content": "Conversation context (for follow-up questions):"})
         messages.append({"role": "user", "content": summarize_memory(memory)})
 
+    # ✅ Hard constraint: results exist
+    messages.append({"role": "user", "content": "The query returned rows. Do NOT say 'no matching records'."})
+
     messages.append({"role": "user", "content": f"User question: {user_question}"})
-    messages.append({"role": "user", "content": f"SQL used:\n{sql}"})
     messages.append({"role": "user", "content": f"Result preview:\n{table_preview}"})
 
     return chat(messages, temperature=0.2, mode=mode).text.strip()
@@ -203,14 +261,14 @@ def answer_with_data(
 def ask_hr_bot(user_question: str, memory: List[Dict[str, str]], mode: str):
     sql = generate_sql(user_question, memory, mode)
 
-    # If still invalid after retry, force one more regen with strictness
     if not is_valid_sql_for_hr(sql):
         sql = ensure_limit(
             chat(
                 [
                     {"role": "system", "content": SQL_SYSTEM},
                     {"role": "user", "content": "Write ONE valid SQLite SELECT query using FROM employees only."},
-                    {"role": "user", "content": "If the question asks 'how many', use SELECT COUNT(*)."},
+                    {"role": "user", "content": "Attrition is TEXT ('Yes'/'No'), never 1/0."},
+                    {"role": "user", "content": "For rates use 100.0*SUM(CASE...)/COUNT(*)."},
                     {"role": "user", "content": f"Question: {user_question}"},
                 ],
                 temperature=0.0,
