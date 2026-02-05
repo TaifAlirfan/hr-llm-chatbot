@@ -31,24 +31,6 @@ The chatbot supports:
 
 ---
 
-## Architecture
-
-The HR Dataset Chatbot follows a modular Text-to-SQL architecture with session-based memory.  
-User questions are translated into SQL queries, executed on a local SQLite database, and the results are summarized in natural language using a Large Language Model (LLM).
-
-The system supports two inference modes:
-- Groq API (fast, cloud-based)  
-- Local Hugging Face model (offline fallback)  
-
-### High-Level Flow
-
-1. User submits a natural language question via the Streamlit UI  
-2. Recent conversation memory is appended for context  
-3. An LLM generates a valid SQLite query based on the schema  
-4. The query is executed against the local HR database  
-5. Results are summarized into a concise answer  
-6. The interaction is stored in session memory  
-
 ### Architecture Diagram 
 ```text
 User
