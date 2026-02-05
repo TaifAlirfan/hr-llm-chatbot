@@ -2,7 +2,7 @@ import re
 import pandas as pd
 from typing import List, Dict
 
-from .rag_sql import SCHEMA_HINT, run_sql
+from .sql_engine import SCHEMA_HINT, run_sql
 from .llm_clients import chat
 
 
